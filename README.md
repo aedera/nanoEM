@@ -4,7 +4,7 @@ This repository contains utilities to call DNA methylation from samples treated 
 
 ## Requirements
 
-* Pyton3
+* Python 3
 * [Parasail-python](https://github.com/jeffdaily/parasail-python)
 
 ## Usage
