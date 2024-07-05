@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import gzip
+import sys
+import uuid
+import numpy as np
+
+if __name__ == '__main__':
+    fname = sys.argv[1]
+
+    f = gzip.open(fname, 'rt')
+    nlines = 0
+    while True:
+        entry = [f.readline().strip() for _ in range(4)]
+        if not entry[0]:
+            break
+
+        if len(entry[1]) > 1_000:
+            seq, qual = np.array(list(entry[1])), np.array(list(entry[3]))
+            seq, qual = np.array_split(seq, seq.shape[0]//500), np.array_split(qual, qual.shape[0]//500)
+            for k, (s, q) in enumerate(zip(seq, qual)):
+                if s.shape[0]>100:
+                    unique_id = '@'+str(uuid.uuid4())
+                    outstr = f'{unique_id}_{nlines}_{k}\n{"".join(s)}\n+\n{"".join(q)}'
+                    print(outstr)#.encode('utf-8'))
+                else:
+                    print(f"excluded len={len(s)}")
+        else:
+            outstr = f'{entry[0]}\n{entry[1]}\n+\n{entry[3]}'
+            print(outstr)#.encode('utf-8'))
+        nlines+=1

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+import sys
+import glob
+import os
+import parasail
+import pandas as pd
+
+import multiprocessing as mp
+from multiprocessing import Process, Queue
+import time
+
+import shutil
+
+TOKEN     = 'KILL'
+QLIMIT    = 500
+BSIZE     = 10_000
+TIME_WAIT = 1
+
+char_map = {
+    'A': 'T',
+    'C': 'G',
+    'G': 'C',
+    'T': 'A',
+    # Add more mappings as needed
+}
+tab = str.maketrans(char_map)
+
+def rc(s):
+    rc_s = s[::-1]
+    rc_s = rc_s.translate(tab)
+    return rc_s
+
+class Worker(Process):
+    def __init__(self, fn, idxs, queue):
+        super(Worker, self).__init__()
+        self.fn = fn
+        self.queue = queue
+
+        self.idxs = idxs
+        self.mat1 = parasail.dnafull.copy()
+        self.mthr = 0 # number of mismatches
+
+    def _perform_alignments(self, seq):
+        aligns,tbs,nms = [],[],[]
+        for i, query in enumerate(self.idxs):
+            align = parasail.sg_qx_trace(
+                seq,
+                query,
+                100,
+                100,
+                self.mat1
+            )
+            tb = align.get_traceback()
+            nm = len(query)-tb.comp.strip().count('|') # number of mismatches
+            assert nm>=0
+
+            aligns.append(align)
+            tbs.append(tb)
+            nms.append(nm)
+
+        # reverse complemented query sequence
+        rc_aligns,rc_tbs,rc_nms = [],[],[]
+        for i, query in enumerate(self.idxs):
+            query = rc(query)
+            align = parasail.sg_qx_trace(
+                seq,
+                query,
+                100,
+                100,
+                self.mat1
+            )
+
+            tb = align.get_traceback()
+            nm = len(query) - tb.comp.strip().count('|') # number of mismatches
+            assert nm>=0
+
+            rc_aligns.append(align)
+            rc_tbs.append(tb)
+            rc_nms.append(nm)
+
+        cnd = [
+            all([a<=self.mthr for a in nms]),
+            all([a<=self.mthr for a in rc_nms]),
+        ] # check presence of both indexes; reads containing solely one index are excluded
+
+        if cnd[0]: # forward indexes
+            lpos = aligns[0].end_query/len(seq)
+            rpos = aligns[1].end_query/len(seq)
+            if lpos <= 0.25 and rpos >= 0.8: # indexes at the ends of read
+                return True
+
+        if cnd[1]: # reverse indexes
+            lpos = rc_aligns[1].end_query/len(seq)
+            rpos = rc_aligns[0].end_query/len(seq)
+            if lpos <= 0.25 and rpos >= 0.8: # indexes at the ends of read
+                return True
+        return False
+
+    def run(self):
+        while True:
+            e = self.queue.get()
+            if e == TOKEN:
+                self.queue.put(TOKEN)
+                break
+
+            pos, n_batch, bsize = e
+            f = open(self.fn, 'r')
+            f.seek(pos)
+
+            fout = open(f'{n_batch}_tmp.sam', 'w')
+            nline = 0
+            while True:
+                if nline >= bsize:
+                    break
+
+                line = f.readline()
+                seq = line.split('\t')[9]
+
+                rs = self._perform_alignments(seq)
+                if rs:
+                    fout.write(line)
+
+                nline +=1
+            #######
+            f.close()
+            fout.close()
+
+if __name__ == '__main__':
+    sam_fn = sys.argv[1]
+    idxs = [sys.argv[2], sys.argv[3]] #i5, i7
+
+    outfn = sys.argv[4]
+
+
+    queue = Queue()
+
+    nproc = 100
+    workers = []
+    for _ in range(nproc):
+        w = Worker(sam_fn, idxs, queue)
+        w.start()
+        workers.append(w)
+
+    pos     = []
+    n_batch = 0
+    header = []
+    with open(sam_fn, 'r') as f:
+        while True:
+            pos.append(f.tell())
+            line = f.readline()
+
+            if not line:
+                pos = pos[:-1] # remove last line that it's blank
+                break
+
+            if line[0] == '@': # skip sam header
+                header.append(line)
+                pos = []
+                continue
+            
+            if len(pos) >= BSIZE:
+                queue.put([pos[0], str(n_batch).zfill(7), len(pos)])
+
+                while queue.qsize() > QLIMIT:
+                    time.sleep(1)
+
+                pos = []
+                n_batch += 1
+
+    if len(pos)>0:
+        queue.put([pos[0], str(n_batch).zfill(7), len(pos)])
+
+    queue.put(TOKEN)
+    [w.join() for w in workers]
+
+    # outfile
+    header_fn = 'header.tmp'
+    out = open(header_fn, 'w')
+    for line in header:
+        out.write(line)
+
+    # join files
+    files = [header_fn] + sorted(glob.glob('*_tmp.sam'))
+    with open(outfn, 'w') as outfile:
+        for f in files:
+            with open(f, 'r') as infile:
+                shutil.copyfileobj(infile, outfile)
+
+    [os.remove(f) for f in files]
